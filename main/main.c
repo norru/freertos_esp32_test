@@ -14,6 +14,21 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event_loop.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+
+static const char *TAG = "example";
+
 /**
  * Brief:
  * This test code shows how to configure gpio and how to use gpio interrupt.
@@ -58,11 +73,91 @@ static void gpio_task_example(void* arg) {
 static void simple_task_output(void *arg) {
 	const TickType_t xDelay = 500 / portTICK_PERIOD_MS;
 	for (;;) {
-		printf("Doing nothing for %s\n", arg ? (const char*) arg : "NULL");
+		// printf("Doing nothing for %s\n", arg ? (const char*) arg : "NULL");
 		vTaskDelay(xDelay);
 	}
 
 	vTaskDelete(NULL);
+}
+
+static void poll_task(void * _arg) {
+	//install gpio isr service
+	gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+	//hook isr handler for specific gpio pin
+	gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler,
+			(void*) GPIO_INPUT_IO_0);
+	//hook isr handler for specific gpio pin
+	gpio_isr_handler_add(GPIO_INPUT_IO_1, gpio_isr_handler,
+			(void*) GPIO_INPUT_IO_1);
+
+	//remove isr handler for gpio number.
+	gpio_isr_handler_remove(GPIO_INPUT_IO_0);
+	//hook isr handler for specific gpio pin again
+	gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler,
+			(void*) GPIO_INPUT_IO_0);
+
+	int cnt = 0;
+	while (1) {
+		printf("cnt: %d\n", cnt++);
+		vTaskDelay(1000 / portTICK_RATE_MS);
+		gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
+		gpio_set_level(GPIO_OUTPUT_IO_1, cnt % 2);
+	}
+}
+
+#ifndef EXAMPLE_WIFI_SSID
+#define EXAMPLE_WIFI_SSID "SSID"
+#endif
+
+#ifndef EXAMPLE_WIFI_PASS
+#define EXAMPLE_WIFI_PASS "password"
+#endif
+
+const int CONNECTED_BIT = BIT0;
+
+/* FreeRTOS event group to signal when we are connected & ready to make a request */
+static EventGroupHandle_t wifi_event_group;
+
+static esp_err_t event_handler(void *ctx, system_event_t *event)
+{
+    switch(event->event_id) {
+    case SYSTEM_EVENT_STA_START:
+        esp_wifi_connect();
+        break;
+    case SYSTEM_EVENT_STA_GOT_IP:
+        xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+        break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+        /* This is a workaround as ESP32 WiFi libs don't currently
+           auto-reassociate. */
+        esp_wifi_connect();
+        xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
+        break;
+    default:
+        break;
+    }
+    return ESP_OK;
+}
+
+
+static void initialise_wifi(void)
+{
+    tcpip_adapter_init();
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK( esp_event_loop_init(event_handler, NULL) );
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
+    ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_WIFI_SSID,
+            .password = EXAMPLE_WIFI_PASS,
+        },
+    };
+    ESP_LOGI(TAG, "Setting WiFi configuration SSID %s...", wifi_config.sta.ssid);
+    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK( esp_wifi_start() );
 }
 
 void app_main() {
@@ -95,32 +190,12 @@ void app_main() {
 
 	//create a queue to handle gpio event from isr
 	gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+	initialise_wifi();
 	//start gpio task
 	xTaskCreate(gpio_task_example, "gpio_task_example", 2048, NULL, 10, NULL);
 	xTaskCreate(simple_task_output, "One", 2048, "Instance One", 10, NULL);
 	xTaskCreate(simple_task_output, "Two", 2048, "Instance Two", 10, NULL);
+	xTaskCreate(poll_task, "main_task", 2048,  NULL, 10, NULL);
 
-	//install gpio isr service
-	gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-	//hook isr handler for specific gpio pin
-	gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler,
-			(void*) GPIO_INPUT_IO_0);
-	//hook isr handler for specific gpio pin
-	gpio_isr_handler_add(GPIO_INPUT_IO_1, gpio_isr_handler,
-			(void*) GPIO_INPUT_IO_1);
-
-	//remove isr handler for gpio number.
-	gpio_isr_handler_remove(GPIO_INPUT_IO_0);
-	//hook isr handler for specific gpio pin again
-	gpio_isr_handler_add(GPIO_INPUT_IO_0, gpio_isr_handler,
-			(void*) GPIO_INPUT_IO_0);
-
-	int cnt = 0;
-	while (1) {
-		printf("cnt: %d\n", cnt++);
-		vTaskDelay(1000 / portTICK_RATE_MS);
-		gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
-		gpio_set_level(GPIO_OUTPUT_IO_1, cnt % 2);
-	}
 }
 
